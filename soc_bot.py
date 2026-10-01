@@ -4,8 +4,8 @@ AI SOC Bot — triage Wazuh alerts with a local LLM (Ollama).
 
 Pulls recent high-severity alerts from the Wazuh indexer and asks a locally
 run model (via Ollama) to triage each one: what happened, how serious, whether
-it looks like a false positive, and what to do next. Everything runs locally —
-no alert data leaves the machine.
+it looks like a false positive, and what to do next. Alert content stays inside
+the local lab environment and is not sent to a third-party cloud LLM API.
 
 Usage:
     python soc_bot.py                 # triage recent level>=10 alerts
@@ -36,14 +36,16 @@ WAZUH_PASS = os.getenv("WAZUH_PASS", "")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 
+SEVERITIES = {"Informational", "Low", "Medium", "High", "Critical"}
+FALSE_POSITIVE_VALUES = {"Likely", "Unlikely"}
+
 TRIAGE_SYSTEM = (
     "You are a Tier-1 SOC analyst. You are given ONE security alert from a "
     "Wazuh SIEM in a lab environment. Triage it concisely for a busy analyst. "
-    "Answer in exactly these four short sections, nothing else:\n"
-    "SUMMARY: one sentence — what happened.\n"
-    "SEVERITY: one of [Informational, Low, Medium, High, Critical] + a few words why.\n"
-    "FALSE POSITIVE?: Likely / Unlikely + a few words why.\n"
-    "NEXT STEP: one concrete action the analyst should take.\n"
+    "Return ONLY a JSON object with exactly these keys: "
+    '"summary", "severity", "false_positive", "false_positive_reason", "next_step". '
+    '"severity" must be one of: Informational, Low, Medium, High, Critical. '
+    '"false_positive" must be Likely or Unlikely. '
     "Do not invent details that are not in the alert."
 )
 
@@ -76,16 +78,23 @@ def get_alerts(level: int, count: int) -> list[dict]:
         if resp.status_code == 401:
             sys.exit("ERROR: indexer auth failed (401). Check WAZUH_PASS in .env.")
         sys.exit(f"ERROR: indexer returned {resp.status_code}: {e}")
+    except requests.exceptions.RequestException as e:
+        sys.exit(f"ERROR: indexer request failed: {e}")
 
-    return [hit["_source"] for hit in resp.json()["hits"]["hits"]]
+    try:
+        hits = resp.json()["hits"]["hits"]
+    except (ValueError, KeyError, TypeError):
+        sys.exit("ERROR: indexer returned an unexpected response format.")
+
+    return [hit["_source"] for hit in hits if isinstance(hit, dict) and "_source" in hit]
 
 
 def extract_fields(alert: dict) -> dict:
-    """Pull the fields we care about out of a raw Wazuh alert (safely)."""
-    rule = alert.get("rule", {})
-    data = alert.get("data", {})
-    agent = alert.get("agent", {})
-    mitre = rule.get("mitre", {})
+    """Pull the fields we care about out of a raw Wazuh alert safely."""
+    rule = alert.get("rule", {}) or {}
+    data = alert.get("data", {}) or {}
+    agent = alert.get("agent", {}) or {}
+    mitre = rule.get("mitre", {}) or {}
     return {
         "time": alert.get("timestamp", "?"),
         "agent": agent.get("name", "?"),
@@ -100,20 +109,20 @@ def extract_fields(alert: dict) -> dict:
 
 
 def group_alerts(alerts: list[dict]) -> list[dict]:
-    """Collapse duplicate alerts (same rule + source IP) into one group.
+    """Collapse duplicate alerts into one group.
 
-    Returns a list of groups, each the most recent alert of its kind plus a
-    `count` of how many times it was seen. Ordered by count (noisiest first).
+    The grouping key includes host, rule, source IP, and URL so events from
+    different endpoints are not accidentally merged. Each group keeps the most
+    recent representative event and a count of how many times it was seen.
     """
     groups: dict[tuple, dict] = {}
     for alert in alerts:
         f = extract_fields(alert)
-        key = (f["rule_id"], f["srcip"])
+        key = (f["agent"], f["rule_id"], f["srcip"], f["url"])
         if key not in groups:
             groups[key] = {"fields": f, "count": 1}
         else:
             groups[key]["count"] += 1
-            # keep the most recent timestamp as the representative one
             if f["time"] > groups[key]["fields"]["time"]:
                 groups[key]["fields"] = f
     return sorted(groups.values(), key=lambda g: g["count"], reverse=True)
@@ -134,34 +143,102 @@ def build_prompt(f: dict) -> str:
     )
 
 
-def triage(prompt: str) -> str:
-    """Send one alert to Ollama and return the model's triage text."""
+def parse_triage(raw: str) -> dict[str, str]:
+    """Validate the structured JSON returned by the local LLM."""
     try:
-        resp = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "system": TRIAGE_SYSTEM,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"temperature": 0.2},
-            },
-            timeout=120,
-        )
-        resp.raise_for_status()
-    except requests.exceptions.ConnectionError:
-        sys.exit(
-            f"ERROR: could not reach Ollama at {OLLAMA_URL}.\n"
-            "Is the service running?  systemctl is-active ollama"
-        )
-    return resp.json().get("response", "").strip()
+        result = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError("response was not valid JSON") from e
+
+    if not isinstance(result, dict):
+        raise ValueError("response JSON was not an object")
+
+    required = {
+        "summary",
+        "severity",
+        "false_positive",
+        "false_positive_reason",
+        "next_step",
+    }
+    if set(result) != required:
+        missing = required - set(result)
+        extra = set(result) - required
+        details = []
+        if missing:
+            details.append(f"missing: {', '.join(sorted(missing))}")
+        if extra:
+            details.append(f"extra: {', '.join(sorted(extra))}")
+        raise ValueError("unexpected fields (" + "; ".join(details) + ")")
+
+    for key in required:
+        if not isinstance(result[key], str) or not result[key].strip():
+            raise ValueError(f"{key} must be a non-empty string")
+        result[key] = result[key].strip()
+
+    if result["severity"] not in SEVERITIES:
+        raise ValueError("severity is outside the allowed set")
+    if result["false_positive"] not in FALSE_POSITIVE_VALUES:
+        raise ValueError("false_positive must be Likely or Unlikely")
+
+    return result
+
+
+def format_triage(result: dict[str, str]) -> str:
+    """Render validated triage JSON into the existing human-readable format."""
+    return (
+        f"SUMMARY: {result['summary']}\n"
+        f"SEVERITY: {result['severity']}\n"
+        f"FALSE POSITIVE?: {result['false_positive']} — {result['false_positive_reason']}\n"
+        f"NEXT STEP: {result['next_step']}"
+    )
+
+
+def triage(prompt: str) -> str:
+    """Send one alert to Ollama, validate its JSON, and return formatted triage."""
+    last_error = "unknown validation error"
+    for _attempt in range(2):
+        try:
+            resp = requests.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "system": TRIAGE_SYSTEM,
+                    "prompt": prompt,
+                    "format": "json",
+                    "stream": False,
+                    "options": {"temperature": 0.2},
+                },
+                timeout=120,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            raw = payload.get("response", "")
+            return format_triage(parse_triage(raw))
+        except requests.exceptions.ConnectionError:
+            sys.exit(
+                f"ERROR: could not reach Ollama at {OLLAMA_URL}.\n"
+                "Is the service running?  systemctl is-active ollama"
+            )
+        except requests.exceptions.RequestException as e:
+            sys.exit(f"ERROR: Ollama request failed: {e}")
+        except (ValueError, TypeError) as e:
+            last_error = str(e)
+
+    sys.exit(
+        "ERROR: Ollama returned invalid structured triage twice. "
+        f"Last validation error: {last_error}"
+    )
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Triage Wazuh alerts with a local LLM.")
     ap.add_argument("--level", type=int, default=10, help="min rule level (default 10)")
-    ap.add_argument("--count", type=int, default=50,
-                    help="how many recent alerts to fetch before grouping (default 50)")
+    ap.add_argument(
+        "--count",
+        type=int,
+        default=50,
+        help="how many recent alerts to fetch before grouping (default 50)",
+    )
     ap.add_argument("--save", action="store_true", help="also save a Markdown report")
     args = ap.parse_args()
 
@@ -174,7 +251,6 @@ def main() -> None:
         print("No matching alerts found.")
         return
 
-    # Collapse duplicates (same rule + source IP) so each threat is triaged once.
     groups = group_alerts(alerts)
     print(f"{len(alerts)} alerts → {len(groups)} distinct threat(s) after grouping.\n")
 
@@ -188,8 +264,10 @@ def main() -> None:
     for i, g in enumerate(groups, 1):
         f = g["fields"]
         seen = f"(seen {g['count']}×)" if g["count"] > 1 else ""
-        print(f"[{i}/{len(groups)}] Rule {f['rule_id']} (lvl {f['level']}) {seen} "
-              f"{f['description']}  —  triaging...")
+        print(
+            f"[{i}/{len(groups)}] Rule {f['rule_id']} (lvl {f['level']}) {seen} "
+            f"{f['description']}  —  triaging..."
+        )
         verdict = triage(build_prompt(f))
 
         block = (
@@ -206,7 +284,7 @@ def main() -> None:
     if args.save:
         os.makedirs("reports", exist_ok=True)
         fname = f"reports/triage-{dt.datetime.now():%Y%m%d-%H%M%S}.md"
-        with open(fname, "w") as fh:
+        with open(fname, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines))
         print(f"\nSaved report to {fname}")
 

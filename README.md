@@ -1,23 +1,15 @@
 # AI SOC Bot
 
-A local, private AI that triages **Wazuh SIEM alerts** using a language model
-running entirely on your own machine via **Ollama** — no cloud, no API keys, no
-alert data ever leaving the host.
+A local AI assistant that triages **Wazuh SIEM alerts** with an on-device language model via **Ollama**. Alert content stays inside the local lab environment and is not sent to a third-party cloud LLM API.
 
-It pulls recent high-severity alerts from the Wazuh indexer, groups duplicates,
-and asks a local model to triage each distinct threat: what happened, how
-serious, whether it's likely a false positive, and the recommended next step.
+It pulls recent high-severity alerts from the Wazuh indexer, groups duplicates, and asks a local model to triage each distinct threat: what happened, how serious it is, whether it is likely a false positive, and the recommended next step.
 
 > Companion to the [Wazuh SOC Lab](https://github.com/Alexander-Remnitz/wazuh-soc-lab).
-> That project **detects** attacks; this one **triages** the alerts they produce —
-> the "automate" step of attack → detect → automate.
+> That project **detects** attacks; this one **triages** the alerts they produce — the "automate" step of attack → detect → automate.
 
 ## Why local
 
-Alert data is sensitive. Sending it to a hosted LLM API means shipping your
-security telemetry to a third party. This bot runs the model **locally with
-Ollama**, so triage happens on the same machine that holds the data — private
-by design, and free to run.
+Security telemetry can be sensitive. The bot uses a locally hosted Ollama model instead of a hosted LLM API, so alert content remains within the lab environment. The Wazuh indexer is reached through an SSH tunnel rather than exposing the indexer service to the network.
 
 ## How it works
 
@@ -25,18 +17,18 @@ by design, and free to run.
 Wazuh indexer (alerts)              This bot                 Ollama (local LLM)
   wazuh-alerts-*    ──SSH tunnel──►  fetch → group  ──HTTP──►  llama3.2:3b (GPU)
                                      duplicates                 │
-                                          ◄── triage text ──────┘
+                                          ◄── JSON triage ──────┘
                                           │
-                                     printed report + Markdown file
+                                     validate + format
+                                          │
+                                     terminal + Markdown report
 ```
 
 1. **Fetch** — query the indexer for recent alerts at/above a severity level.
-2. **Group** — collapse duplicates (same rule + source IP) so each threat is triaged once, with a "seen N×" count.
-3. **Triage** — send each distinct threat to the local model for a structured verdict.
-4. **Report** — print to the terminal and optionally save a timestamped Markdown report.
-
-The indexer is reached over an **SSH tunnel**, so it stays bound to localhost on
-the Wazuh host and is never exposed on the network — a deliberate security choice.
+2. **Group** — collapse duplicates using host + rule + source IP + URL, so similar events from different endpoints are not accidentally merged.
+3. **Triage** — send each distinct threat to the local model and request structured JSON.
+4. **Validate** — require the expected fields and allowed severity/false-positive values; retry once if the model returns malformed output.
+5. **Report** — print the validated result to the terminal and optionally save a timestamped Markdown report.
 
 ## Setup
 
@@ -71,6 +63,12 @@ python soc_bot.py --count 100     # fetch more alerts before grouping
 python soc_bot.py --save          # also write a Markdown report to reports/
 ```
 
+Run the unit tests with:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 See [`docs/sample-report.md`](docs/sample-report.md) for example output.
 
 ## Sample output
@@ -80,7 +78,7 @@ See [`docs/sample-report.md`](docs/sample-report.md) for example output.
 
 [1/3] Rule 31151 (lvl 10) (seen 45×) Multiple web server 400 error codes ...
 SUMMARY: Multiple web server 400 errors from the same source IP (web scan).
-SEVERITY: Low — automated scanning (gobuster seen in the log), not a breach.
+SEVERITY: Low
 FALSE POSITIVE?: Likely — signature of a directory brute-force tool.
 NEXT STEP: Confirm the source IP and block it if unauthorized.
 ```
@@ -95,16 +93,15 @@ NEXT STEP: Confirm the source IP and block it if unauthorized.
 | `OLLAMA_URL` | Local Ollama endpoint | `http://127.0.0.1:11434` |
 | `OLLAMA_MODEL` | Model to use | `llama3.2:3b` |
 
-## Limitations (honest notes)
+## Limitations
 
-- A small 3B model is fast and private but **not authoritative** — it occasionally
-  disagrees with itself on "false positive". It's a triage **assist**, not a
-  replacement for an analyst. A human stays in the loop.
-- Triage quality scales with model size; a larger model (if VRAM allows) gives
-  steadier verdicts. The model is a one-line change in `.env`.
+- A small 3B model is fast and private but **not authoritative**. It is a triage assist, not a replacement for an analyst; a human stays in the loop.
+- Triage quality varies by model. A larger model can provide steadier output if hardware permits.
+- The Wazuh indexer currently uses a self-signed certificate and the client disables TLS certificate verification because the connection is carried through a local SSH tunnel. A production deployment should trust the Wazuh CA and enable certificate verification.
+- The bot groups alerts heuristically. Host + rule + source IP + URL is safer than the original rule + source-IP key, but production correlation would normally use richer event context.
 
 ## Security
 
-- No alert data leaves the machine — the model runs locally.
-- The indexer is reached over an SSH tunnel, not exposed on the network.
-- `.env` (holding the password) and `reports/` are gitignored and never committed.
+- Alert content is processed by a local Ollama model and is not sent to a hosted LLM API.
+- The indexer is reached over an SSH tunnel instead of exposing port 9200 to the network.
+- `.env` (holding the password) and `reports/` are gitignored and never intentionally committed.
