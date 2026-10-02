@@ -105,3 +105,17 @@ NEXT STEP: Confirm the source IP and block it if unauthorized.
 - Alert content is processed by a local Ollama model and is not sent to a hosted LLM API.
 - The indexer is reached over an SSH tunnel instead of exposing port 9200 to the network.
 - `.env` (holding the password) and `reports/` are gitignored and never intentionally committed.
+
+## Live end-to-end verification
+
+**Verified 2026-10-02.** The complete integration path was tested successfully against the live Wazuh lab:
+
+`Wazuh indexer → SSH tunnel → alert fetch → grouping → Ollama llama3.2:3b → structured JSON validation → terminal output → Markdown report`
+
+- Wazuh indexer returned HTTP 200 through the local SSH tunnel.
+- The bot fetched 5 live level-10 alerts and grouped them into 3 distinct threats.
+- Local Ollama generated triage for all 3 groups.
+- Structured responses passed the bot validation path.
+- A Markdown report was written successfully to `reports/`.
+- Generated reports remain excluded from Git by `.gitignore`.
+- The small 3B model can still produce semantically inconsistent judgments, so human review remains required.
